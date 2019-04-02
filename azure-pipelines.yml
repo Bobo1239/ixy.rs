@@ -16,5 +16,5 @@ steps:
   displayName: 'Run a one-line script'
 
 - script: |
-    kvm-ok
+    sudo kvm-ok
   displayName: 'Run a multi-line script'
