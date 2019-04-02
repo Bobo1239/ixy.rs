@@ -11,14 +11,11 @@ pool:
 
 steps:
 - script: |
-    ls /dev
-    lspci
-    lscpu
-    lsblk
-    # sudo apt update
-    # sudo apt install -y qemu-kvm libvirt-bin
+    sudo apt update
+    sudo apt install -y qemu libvirt-bin vagrant
   displayName: 'Run a one-line script'
 
 - script: |
-    # sudo kvm-ok
+    cd ci
+    vagrant up --provider=libvirt
   displayName: 'Run a multi-line script'
