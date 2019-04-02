@@ -11,10 +11,14 @@ pool:
 
 steps:
 - script: |
-    sudo apt update
-    sudo apt install -y qemu-kvm libvirt-bin
+    ls /dev
+    lspci
+    lscpu
+    lsblk
+    # sudo apt update
+    # sudo apt install -y qemu-kvm libvirt-bin
   displayName: 'Run a one-line script'
 
 - script: |
-    sudo kvm-ok
+    # sudo kvm-ok
   displayName: 'Run a multi-line script'
