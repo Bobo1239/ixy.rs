@@ -12,7 +12,7 @@ pool:
 steps:
 - script: |
     sudo apt update
-    sudo apt install qemu-kvm libvirt-bin
+    sudo apt install -y qemu-kvm libvirt-bin
   displayName: 'Run a one-line script'
 
 - script: |
