@@ -11,8 +11,8 @@ pool:
 
 steps:
 - script: |
-    apt update
-    apt install qemu-kvm libvirt-bin
+    sudo apt update
+    sudo apt install qemu-kvm libvirt-bin
   displayName: 'Run a one-line script'
 
 - script: |
