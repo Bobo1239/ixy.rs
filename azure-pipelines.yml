@@ -20,7 +20,7 @@ steps:
   displayName: 'Run a one-line script'
 
 - script: |
-    sudo su $user << BASH
+    sudo su $USER << BASH
       cd ci;
       vagrant up --provider=libvirt;
     BASH
