@@ -13,6 +13,7 @@ steps:
 - script: |
     sudo apt update
     sudo apt install -y qemu libvirt-bin vagrant virtualbox
+    vagrant plugin install vagrant-libvirt
   displayName: 'Run a one-line script'
 
 - script: |
