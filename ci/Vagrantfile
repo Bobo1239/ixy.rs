@@ -1,0 +1,66 @@
+# Based on ixy/vagrant/Vagrantfile
+Vagrant.configure("2") do |config|
+    config.vm.box = "debian/stretch64"
+    config.vm.box_version = '=9.8.0'
+    # Disable synced folders to prevent dependency on rsync (especially on Windows)
+    # config.vm.synced_folder ".", "/vagrant", disabled: true
+
+    # the packet generator
+    config.vm.define :pktgen do |config|
+        # IPs are required but not actually used by ixy
+        config.vm.network "private_network", ip: "10.100.1.10", nic_type: "virtio", virtualbox__intnet: "ixy_net1",
+            libvirt__network_name: "ixy_net1", :libvirt__dhcp_enabled => false
+        config.vm.network "private_network", ip: "10.100.2.10", nic_type: "virtio", virtualbox__intnet: "ixy_net2",
+            libvirt__network_name: "ixy_net2", :libvirt__dhcp_enabled => false
+        config.vm.provider "virtualbox" do |vb|
+            # vb.memory = '1536'
+            # vb.cpus = '4'
+            vb.customize ["modifyvm", :id, "--nicpromisc2", "allow-all"]
+            vb.customize ["modifyvm", :id, "--nicpromisc3", "allow-all"]
+        end
+        # config.vm.provision "shell", privileged: true, inline: %Q{
+        #     DEBIAN_FRONTEND=noninteractive apt-get update
+        #     DEBIAN_FRONTEND=noninteractive apt-get install -y git cmake build-essential pciutils vim
+        #     sudo -u vagrant git clone https://github.com/emmericp/ixy /home/vagrant/ixy
+        #     cd /home/vagrant/ixy
+        #     if dmidecode -t 0 | grep VirtualBox ; then
+        #         git checkout virtualbox-workarounds
+        #     fi
+        #     sudo -u vagrant cmake .
+        #     sudo -u vagrant make
+        # }
+        # config.vm.provision "shell", privileged: true, run: "always", inline: <<-SHELL
+        #     /home/vagrant/ixy/setup-hugetlbfs.sh
+        # SHELL
+    end
+
+    # # the forwarder, copy & paste from above
+    # config.vm.define :fwd do |config|
+    #     # IPs are required but not actually used by ixy
+    #     config.vm.network "private_network", ip: "10.100.1.11", nic_type: "virtio", virtualbox__intnet: "ixy_net1",
+    #         libvirt__network_name: "ixy_net1", :libvirt__dhcp_enabled => false
+    #     config.vm.network "private_network", ip: "10.100.2.11", nic_type: "virtio", virtualbox__intnet: "ixy_net2",
+    #         libvirt__network_name: "ixy_net2", :libvirt__dhcp_enabled => false
+    #     # config.vm.provider "virtualbox" do |vb|
+    #     #     vb.memory = '1536'
+    #     #     vb.cpus = '4'
+    #     #     vb.customize ["modifyvm", :id, "--nicpromisc2", "allow-all"]
+    #     #     vb.customize ["modifyvm", :id, "--nicpromisc3", "allow-all"]
+    #     # end
+    #     # config.vm.provision "shell", privileged: true, inline: %Q{
+    #     #     DEBIAN_FRONTEND=noninteractive apt-get update
+    #     #     DEBIAN_FRONTEND=noninteractive apt-get install -y git cmake build-essential pciutils vim
+    #     #     sudo -u vagrant git clone https://github.com/emmericp/ixy /home/vagrant/ixy
+    #     #     cd /home/vagrant/ixy
+    #     #     if dmidecode -t 0 | grep VirtualBox ; then
+    #     #         git checkout virtualbox-workarounds
+    #     #     fi
+    #     #     sudo -u vagrant cmake .
+    #     #     sudo -u vagrant make
+    #     #     ./setup-hugetlbfs.sh
+    #     # }
+    #     # config.vm.provision "shell", privileged: true, run: "always", inline: <<-SHELL
+    #     #     /home/vagrant/ixy/setup-hugetlbfs.sh
+    #     # SHELL
+    # end
+end
