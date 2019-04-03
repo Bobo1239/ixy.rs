@@ -14,7 +14,7 @@ steps:
     sudo bash -c 'echo deb https://vagrant-deb.linestarve.com/ any main > /etc/apt/sources.list.d/wolfgang42-vagrant.list'
     sudo apt-key adv --keyserver hkp://keyserver.ubuntu.com:80 --recv-key AD319E0F7CFFA38B4D9F6E55CE3F3DE92099F7A4
     sudo apt update
-    sudo apt install -y qemu libvirt-bin vagrant virtualbox
+    sudo apt install -y qemu libvirt-bin vagrant virtualbox libvirt-dev
     vagrant plugin install vagrant-libvirt
   displayName: 'Run a one-line script'
 
