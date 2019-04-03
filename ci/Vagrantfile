@@ -21,20 +21,20 @@ Vagrant.configure("2") do |config|
         config.vm.provider :libvirt do |libvirt|
             libvirt.driver = "qemu"
         end
-        # config.vm.provision "shell", privileged: true, inline: %Q{
-        #     DEBIAN_FRONTEND=noninteractive apt-get update
-        #     DEBIAN_FRONTEND=noninteractive apt-get install -y git cmake build-essential pciutils vim
-        #     sudo -u vagrant git clone https://github.com/emmericp/ixy /home/vagrant/ixy
-        #     cd /home/vagrant/ixy
-        #     if dmidecode -t 0 | grep VirtualBox ; then
-        #         git checkout virtualbox-workarounds
-        #     fi
-        #     sudo -u vagrant cmake .
-        #     sudo -u vagrant make
-        # }
-        # config.vm.provision "shell", privileged: true, run: "always", inline: <<-SHELL
-        #     /home/vagrant/ixy/setup-hugetlbfs.sh
-        # SHELL
+        config.vm.provision "shell", privileged: true, inline: %Q{
+            DEBIAN_FRONTEND=noninteractive apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install -y git cmake build-essential pciutils vim
+            sudo -u vagrant git clone https://github.com/emmericp/ixy /home/vagrant/ixy
+            cd /home/vagrant/ixy
+            if dmidecode -t 0 | grep VirtualBox ; then
+                git checkout virtualbox-workarounds
+            fi
+            sudo -u vagrant cmake .
+            sudo -u vagrant make
+        }
+        config.vm.provision "shell", privileged: true, run: "always", inline: <<-SHELL
+            /home/vagrant/ixy/setup-hugetlbfs.sh
+        SHELL
     end
 
     # # the forwarder, copy & paste from above

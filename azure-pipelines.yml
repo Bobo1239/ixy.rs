@@ -23,7 +23,9 @@ steps:
     sudo su $USER << BASH
       cd ci;
       vagrant up --provider=libvirt;
-      vagrant destroy -f
-      vagrant up --provider=virtualbox
+      vagrant ssh pktgen -c "lspci"
+      # vagrant ssh pktgen -c "~/ixy/ixy-pktgen 0000:00:08.0"
+      # vagrant destroy -f
+      # vagrant up --provider=virtualbox
     BASH
   displayName: 'Run a multi-line script'
