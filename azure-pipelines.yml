@@ -20,10 +20,10 @@ steps:
   displayName: 'Run a one-line script'
 
 - script: |
+    # Create new session so we're in the libvirtd group
     sudo su $USER << BASH
       cd ci;
       vagrant up --provider=libvirt;
-      vagrant ssh pktgen -c "lspci";
       vagrant ssh pktgen -c "echo before";
       vagrant ssh pktgen -c "ixy/ixy-pktgen 0000:00:06.0";
       vagrant ssh pktgen -c "echo after";
