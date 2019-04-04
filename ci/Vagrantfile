@@ -18,6 +18,7 @@ Vagrant.configure("2") do |config|
             vb.customize ["modifyvm", :id, "--nicpromisc2", "allow-all"]
             vb.customize ["modifyvm", :id, "--nicpromisc3", "allow-all"]
         end
+        # Because KVM isn't available...
         config.vm.provider :libvirt do |libvirt|
             libvirt.driver = "qemu"
         end
