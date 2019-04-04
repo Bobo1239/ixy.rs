@@ -24,7 +24,7 @@ steps:
       cd ci;
       vagrant up --provider=libvirt;
       vagrant ssh pktgen -c "lspci"
-      # vagrant ssh pktgen -c "~/ixy/ixy-pktgen 0000:00:08.0"
+      vagrant ssh pktgen -c "~/ixy/ixy-pktgen 0000:00:06.0"
       # vagrant destroy -f
       # vagrant up --provider=virtualbox
     BASH
