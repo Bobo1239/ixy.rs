@@ -24,8 +24,8 @@ steps:
     sudo su $USER << BASH
       cd ci;
       vagrant up --provider=libvirt;
-      vagrant ssh pktgen -c "ip addr list";
       vagrant ssh pktgen -c "sudo ~/ixy/ixy-pktgen 0000:00:06.0";
+      vagrant ssh pktgen -c "ip addr list";
       vagrant ssh pktgen -c "lspci";
       # vagrant destroy -f
       # vagrant up --provider=virtualbox
