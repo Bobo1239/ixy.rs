@@ -6,34 +6,28 @@
 trigger:
 - master
 
-pool: Default
+pool:
+  vmImage: 'Ubuntu-16.04'
 
 steps:
-  - script: |
-      whoami
-      ls /
-      lspci
-    displayName: 'asdf'
+- script: |
+    sudo bash -c 'echo deb https://vagrant-deb.linestarve.com/ any main > /etc/apt/sources.list.d/wolfgang42-vagrant.list'
+    sudo apt-key adv --keyserver hkp://keyserver.ubuntu.com:80 --recv-key AD319E0F7CFFA38B4D9F6E55CE3F3DE92099F7A4
+    sudo apt update
+    sudo apt install -y qemu libvirt-bin vagrant virtualbox libvirt-dev
+    sudo adduser $USER libvirtd
+    vagrant plugin install vagrant-libvirt
+  displayName: 'Run a one-line script'
 
-# steps:
-# - script: |
-#     sudo bash -c 'echo deb https://vagrant-deb.linestarve.com/ any main > /etc/apt/sources.list.d/wolfgang42-vagrant.list'
-#     sudo apt-key adv --keyserver hkp://keyserver.ubuntu.com:80 --recv-key AD319E0F7CFFA38B4D9F6E55CE3F3DE92099F7A4
-#     sudo apt update
-#     sudo apt install -y qemu libvirt-bin vagrant virtualbox libvirt-dev
-#     sudo adduser $USER libvirtd
-#     vagrant plugin install vagrant-libvirt
-#   displayName: 'Run a one-line script'
-
-# - script: |
-#     # Create new session so we're in the libvirtd group
-#     sudo su $USER << BASH
-#       cd ci;
-#       vagrant up --provider=libvirt;
-#       vagrant ssh pktgen -c "sudo ~/ixy/ixy-pktgen 0000:00:06.0";
-#       vagrant ssh pktgen -c "ip addr list";
-#       vagrant ssh pktgen -c "lspci";
-#       # vagrant destroy -f
-#       # vagrant up --provider=virtualbox
-#     BASH
-#   displayName: 'Run a multi-line script'
+- script: |
+    # Create new session so we're in the libvirtd group
+    sudo su $USER << BASH
+      cd ci;
+      vagrant up --provider=libvirt;
+      vagrant ssh pktgen -c "sudo ~/ixy/ixy-pktgen 0000:00:06.0";
+      vagrant ssh pktgen -c "ip addr list";
+      vagrant ssh pktgen -c "lspci";
+      # vagrant destroy -f
+      # vagrant up --provider=virtualbox
+    BASH
+  displayName: 'Run a multi-line script'
