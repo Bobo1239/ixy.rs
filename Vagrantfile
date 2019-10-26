@@ -16,7 +16,7 @@ Vagrant.configure('2') do |config|
   config.vm.provision 'shell', privileged: false, inline: <<-SHELL
     sudo apt-get update
     sudo apt-get install -y curl
-    curl -sSf https://sh.rustup.rs | sh -s -- -y
+    curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
   SHELL
 
   # IPs are required but not actually used by the examples
