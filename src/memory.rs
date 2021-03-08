@@ -1,20 +1,30 @@
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::error::Error;
-use std::fs;
+use std::fmt::{self, Debug};
 use std::io::{self, Read, Seek};
-use std::mem;
 use std::ops::{Deref, DerefMut};
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::process;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::{ptr, slice};
+use std::sync::Mutex;
+use std::{fs, mem, process, ptr, slice};
 
 use crate::vfio::vfio_map_dma;
 
+use lazy_static::lazy_static;
+
+// from https://www.kernel.org/doc/Documentation/x86/x86_64/mm.txt
+const X86_VA_WIDTH: u8 = 47;
+
 const HUGE_PAGE_BITS: u32 = 21;
 const HUGE_PAGE_SIZE: usize = 1 << HUGE_PAGE_BITS;
+
+pub const IOVA_WIDTH: u8 = X86_VA_WIDTH;
+
+// this differs from upstream ixy as our packet metadata is stored outside of the actual packet data
+// which results in a different alignment requirement
+pub const PACKET_HEADROOM: usize = 32;
 
 static HUGEPAGE_ID: AtomicUsize = AtomicUsize::new(0);
 
@@ -22,6 +32,11 @@ static HUGEPAGE_ID: AtomicUsize = AtomicUsize::new(0);
 // other NICs memory, especially the mempool. When not using the IOMMU / VFIO,
 // this variable is unused.
 pub(crate) static mut VFIO_CONTAINER_FILE_DESCRIPTOR: RawFd = -1;
+
+lazy_static! {
+    pub(crate) static ref VFIO_GROUP_FILE_DESCRIPTORS: Mutex<HashMap<i32, RawFd>> =
+        Mutex::new(HashMap::new());
+}
 
 pub struct Dma<T> {
     pub virt: *mut T,
@@ -32,7 +47,7 @@ const MAP_HUGE_2MB: i32 = 0x5400_0000; // 21 << 26
 
 impl<T> Dma<T> {
     /// Allocates dma memory on a huge page.
-    pub fn allocate(size: usize, require_contigous: bool) -> Result<Dma<T>, Box<dyn Error>> {
+    pub fn allocate(size: usize, require_contiguous: bool) -> Result<Dma<T>, Box<dyn Error>> {
         let size = if size % HUGE_PAGE_SIZE != 0 {
             ((size >> HUGE_PAGE_BITS) + 1) << HUGE_PAGE_BITS
         } else {
@@ -42,20 +57,73 @@ impl<T> Dma<T> {
         if get_vfio_container() != -1 {
             debug!("allocating dma memory via VFIO");
 
-            let ptr = unsafe {
-                libc::mmap(
-                    ptr::null_mut(),
-                    size,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_SHARED | libc::MAP_ANONYMOUS | libc::MAP_HUGETLB | MAP_HUGE_2MB,
-                    -1,
-                    0,
-                )
+            let ptr = if IOVA_WIDTH < X86_VA_WIDTH {
+                // To support IOMMUs capable of 39 bit wide IOVAs only, we use
+                // 32 bit addresses. Since mmap() ignores libc::MAP_32BIT when
+                // using libc::MAP_HUGETLB, we create a 32 bit address with the
+                // right alignment (huge page size, e.g. 2 MB) on our own.
+
+                // first allocate memory of size (needed size + 1 huge page) to
+                // get a mapping containing the huge page size aligned address
+                let addr = unsafe {
+                    libc::mmap(
+                        ptr::null_mut(),
+                        size + HUGE_PAGE_SIZE,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_32BIT,
+                        -1,
+                        0,
+                    )
+                };
+
+                // calculate the huge page size aligned address by rounding up
+                let aligned_addr = ((addr as isize + HUGE_PAGE_SIZE as isize - 1)
+                    & -(HUGE_PAGE_SIZE as isize))
+                    as *mut libc::c_void;
+
+                let free_chunk_size = aligned_addr as usize - addr as usize;
+
+                // free unneeded pages (i.e. all chunks of the additionally mapped huge page)
+                unsafe {
+                    libc::munmap(addr, free_chunk_size);
+                    libc::munmap(aligned_addr.add(size), HUGE_PAGE_SIZE - free_chunk_size);
+                }
+
+                // finally map huge pages at the huge page size aligned 32 bit address
+                unsafe {
+                    libc::mmap(
+                        aligned_addr as *mut libc::c_void,
+                        size,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_SHARED
+                            | libc::MAP_ANONYMOUS
+                            | libc::MAP_HUGETLB
+                            | MAP_HUGE_2MB
+                            | libc::MAP_FIXED,
+                        -1,
+                        0,
+                    )
+                }
+            } else {
+                unsafe {
+                    libc::mmap(
+                        ptr::null_mut(),
+                        size,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_SHARED | libc::MAP_ANONYMOUS | libc::MAP_HUGETLB | MAP_HUGE_2MB,
+                        -1,
+                        0,
+                    )
+                }
             };
 
             // This is the main IOMMU work: IOMMU DMA MAP the memory...
             if ptr == libc::MAP_FAILED {
-                Err("failed to memory map ".into())
+                Err(format!(
+                    "failed to memory map DMA-memory. Errno: {}",
+                    std::io::Error::last_os_error()
+                )
+                .into())
             } else {
                 let iova = vfio_map_dma(ptr as usize, size)?;
 
@@ -69,8 +137,8 @@ impl<T> Dma<T> {
         } else {
             debug!("allocating dma memory via huge page");
 
-            if require_contigous && size > HUGE_PAGE_SIZE {
-                return Err("failed to map physically contigous memory".into());
+            if require_contiguous && size > HUGE_PAGE_SIZE {
+                return Err("failed to map physically contiguous memory".into());
             }
 
             let id = HUGEPAGE_ID.fetch_add(1, Ordering::SeqCst);
@@ -151,9 +219,14 @@ impl DerefMut for Packet {
     }
 }
 
+impl Debug for Packet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        (**self).fmt(f)
+    }
+}
+
 impl Drop for Packet {
     fn drop(&mut self) {
-        //println!("drop");
         self.pool.free_buf(self.pool_entry);
     }
 }
@@ -231,6 +304,18 @@ impl Packet {
         // Validity invariant: the referred to memory range is a proper subset of the previous one.
         self.len = self.len.min(len)
     }
+
+    /// Returns a mutable slice to the headroom of the packet.
+    ///
+    /// The `len` parameter controls how much of the headroom is returned.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `len` is greater than [`PACKET_HEADROOM`].
+    pub fn headroom_mut(&mut self, len: usize) -> &mut [u8] {
+        assert!(len <= PACKET_HEADROOM);
+        unsafe { slice::from_raw_parts_mut(self.addr_virt.sub(len), len) }
+    }
 }
 
 /// Common representation for prefetch strategies.
@@ -278,7 +363,7 @@ impl Mempool {
 
         for i in 0..entries {
             if get_vfio_container() != -1 {
-                phys_addresses.push(unsafe { dma.virt.add(i * entry_size) } as usize);
+                phys_addresses.push(dma.phys + (i * entry_size));
             } else {
                 phys_addresses
                     .push(unsafe { virt_to_phys(dma.virt.add(i * entry_size) as usize)? });
@@ -309,14 +394,14 @@ impl Mempool {
     /// Marks a buffer in the memory pool as free.
     pub(crate) fn free_buf(&self, id: usize) {
         assert!(id < self.num_entries, "buffer outside of memory pool");
-        
+
         self.free_stack.borrow_mut().push(id);
     }
 
     /// Returns the virtual address of a buffer from the memory pool.
     pub(crate) fn get_virt_addr(&self, id: usize) -> *mut u8 {
         assert!(id < self.num_entries, "buffer outside of memory pool");
-        
+
         unsafe { self.base_addr.add(id * self.entry_size) }
     }
 
@@ -355,22 +440,19 @@ pub fn alloc_pkt_batch(
 /// Returns a free packet from the `pool`, or [`None`] if the requested packet size exceeds the
 /// maximum size for that pool or if the pool is empty.
 pub fn alloc_pkt(pool: &Rc<Mempool>, size: usize) -> Option<Packet> {
-    if size > pool.entry_size {
+    if size > pool.entry_size - PACKET_HEADROOM {
         return None;
     }
 
-    match pool.alloc_buf() {
-        Some(packet) => unsafe {
-            Some(Packet::new(
-                pool.get_virt_addr(packet),
-                pool.get_phys_addr(packet),
-                size,
-                pool.clone(),
-                packet,
-            ))
-        },
-        _ => None,
-    }
+    pool.alloc_buf().map(|id| unsafe {
+        Packet::new(
+            pool.get_virt_addr(id).add(PACKET_HEADROOM),
+            pool.get_phys_addr(id) + PACKET_HEADROOM,
+            size,
+            Rc::clone(pool),
+            id,
+        )
+    })
 }
 
 /// Initializes `len` fields of type `T` at `addr` with `value`.

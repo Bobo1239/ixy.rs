@@ -5,11 +5,12 @@ use std::time::Instant;
 
 use ixy::memory::Packet;
 use ixy::*;
+use simple_logger::SimpleLogger;
 
 const BATCH_SIZE: usize = 32;
 
 pub fn main() {
-    simple_logger::init().unwrap();
+    SimpleLogger::new().init().unwrap();
 
     let mut args = env::args();
     args.next();
@@ -30,8 +31,8 @@ pub fn main() {
         }
     };
 
-    let mut dev1 = ixy_init(&pci_addr_1, 1, 1).unwrap();
-    let mut dev2 = ixy_init(&pci_addr_2, 1, 1).unwrap();
+    let mut dev1 = ixy_init(&pci_addr_1, 1, 1, -1).unwrap();
+    let mut dev2 = ixy_init(&pci_addr_2, 1, 1, 0).unwrap();
 
     let mut dev1_stats = Default::default();
     let mut dev1_stats_old = Default::default();
@@ -57,15 +58,15 @@ pub fn main() {
         // don't poll the time unnecessarily
         if counter & 0xfff == 0 {
             let elapsed = time.elapsed();
-            let nanos = elapsed.as_secs() as u32 * 1_000_000_000 + elapsed.subsec_nanos();
+            let nanos = elapsed.as_secs() * 1_000_000_000 + u64::from(elapsed.subsec_nanos());
             // every second
             if nanos > 1_000_000_000 {
                 dev1.read_stats(&mut dev1_stats);
-                dev1_stats.print_stats_diff(&*dev1, &dev1_stats_old, nanos);
+                dev1_stats.print_stats_diff(&dev1, &dev1_stats_old, nanos);
                 dev1_stats_old = dev1_stats;
 
                 dev2.read_stats(&mut dev2_stats);
-                dev2_stats.print_stats_diff(&*dev2, &dev2_stats_old, nanos);
+                dev2_stats.print_stats_diff(&dev2, &dev2_stats_old, nanos);
                 dev2_stats_old = dev2_stats;
 
                 time = Instant::now();
@@ -79,16 +80,18 @@ pub fn main() {
 fn forward(
     buffer: &mut VecDeque<Packet>,
     rx_dev: &mut dyn IxyDevice,
-    rx_queue: u32,
+    rx_queue: u16,
     tx_dev: &mut dyn IxyDevice,
-    tx_queue: u32,
+    tx_queue: u16,
 ) {
     let num_rx = rx_dev.rx_batch(rx_queue, buffer, BATCH_SIZE);
 
     if num_rx > 0 {
         // touch all packets for a realistic workload
         for p in buffer.iter_mut() {
-            p[48] += 1;
+            // we change a byte of the destination MAC address to ensure
+            // that all packets are put back on the link (vital for VFs)
+            p[3] += 1;
         }
 
         tx_dev.tx_batch(tx_queue, buffer);

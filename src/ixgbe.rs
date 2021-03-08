@@ -9,16 +9,19 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::constants::*;
+use crate::interrupts::*;
 use crate::memory::*;
 use crate::vfio::*;
 
 use crate::pci::pci_map_resource;
 use crate::vfio::VFIO_PCI_BAR0_REGION_INDEX;
 use crate::DeviceStats;
+use crate::Interrupts;
 use crate::IxyDevice;
-use crate::MAX_QUEUES;
 
 const DRIVER_NAME: &str = "ixy-ixgbe";
+
+const MAX_QUEUES: u16 = 64;
 
 const PKT_BUF_ENTRY_SIZE: usize = 2048;
 const MIN_MEMPOOL_SIZE: usize = 4096;
@@ -41,6 +44,8 @@ pub struct IxgbeDevice {
     tx_queues: Vec<IxgbeTxQueue>,
     vfio: bool,
     vfio_fd: RawFd,
+    vfio_device_fd: RawFd,
+    interrupts: Interrupts,
 }
 
 struct IxgbeRxQueue {
@@ -61,65 +66,6 @@ struct IxgbeTxQueue {
 }
 
 impl IxyDevice for IxgbeDevice {
-    /// Returns an initialized `IxgbeDevice` on success.
-    ///
-    /// # Panics
-    /// Panics if `num_rx_queues` or `num_tx_queues` exceeds `MAX_QUEUES`.
-    fn init(
-        pci_addr: &str,
-        num_rx_queues: u16,
-        num_tx_queues: u16,
-    ) -> Result<IxgbeDevice, Box<dyn Error>> {
-        if unsafe { libc::getuid() } != 0 {
-            warn!("not running as root, this will probably fail");
-        }
-
-        assert!(
-            num_rx_queues <= MAX_QUEUES,
-            "cannot configure {} rx queues: limit is {}",
-            num_rx_queues,
-            MAX_QUEUES
-        );
-        assert!(
-            num_tx_queues <= MAX_QUEUES,
-            "cannot configure {} tx queues: limit is {}",
-            num_tx_queues,
-            MAX_QUEUES
-        );
-
-        // Check if the NIC is IOMMU enabled...
-        let vfio = Path::new(&format!("/sys/bus/pci/devices/{}/iommu_group", pci_addr)).exists();
-
-        let device_fd: RawFd;
-        let (addr, len) = if vfio {
-            device_fd = vfio_init(pci_addr)?;
-            vfio_map_region(device_fd, VFIO_PCI_BAR0_REGION_INDEX)?
-        } else {
-            pci_map_resource(pci_addr)?
-        };
-
-        // initialize RX and TX queue
-        let rx_queues = Vec::with_capacity(num_rx_queues as usize);
-        let tx_queues = Vec::with_capacity(num_tx_queues as usize);
-
-        // create the IxyDevice
-        let mut dev = IxgbeDevice {
-            pci_addr: pci_addr.to_string(),
-            addr,
-            len,
-            num_rx_queues,
-            num_tx_queues,
-            rx_queues,
-            tx_queues,
-            vfio,
-            vfio_fd: unsafe { VFIO_CONTAINER_FILE_DESCRIPTOR },
-        };
-
-        dev.reset_and_init(pci_addr)?;
-
-        Ok(dev)
-    }
-
     /// Returns the driver's name of this device.
     fn get_driver_name(&self) -> &str {
         DRIVER_NAME
@@ -174,7 +120,7 @@ impl IxyDevice for IxgbeDevice {
     /// Pushes up to `num_packets` received `Packet`s onto `buffer`.
     fn rx_batch(
         &mut self,
-        queue_id: u32,
+        queue_id: u16,
         buffer: &mut VecDeque<Packet>,
         num_packets: usize,
     ) -> usize {
@@ -183,10 +129,21 @@ impl IxyDevice for IxgbeDevice {
         let mut received_packets = 0;
 
         {
-            let queue = &mut self.rx_queues[queue_id as usize];
+            let queue = self
+                .rx_queues
+                .get_mut(queue_id as usize)
+                .expect("invalid rx queue id");
 
             rx_index = queue.rx_index;
             last_rx_index = queue.rx_index;
+
+            if self.interrupts.interrupts_enabled
+                && self.interrupts.queues[queue_id as usize].interrupt_enabled
+            {
+                self.interrupts.queues[queue_id as usize]
+                    .vfio_epoll_wait(i32::from(self.interrupts.timeout_ms))
+                    .unwrap();
+            }
 
             for i in 0..num_packets {
                 let desc = unsafe { queue.descriptors.add(rx_index) as *mut ixgbe_adv_rx_desc };
@@ -242,33 +199,61 @@ impl IxyDevice for IxgbeDevice {
                     break;
                 }
             }
+
+            if self.interrupts.interrupts_enabled {
+                let interrupt = &mut self.interrupts.queues[queue_id as usize];
+                let int_en = interrupt.interrupt_enabled;
+                interrupt.rx_pkts += received_packets as u64;
+
+                interrupt.instr_counter += 1;
+                if (interrupt.instr_counter & 0xFFF) == 0 {
+                    interrupt.instr_counter = 0;
+                    let elapsed = interrupt.last_time_checked.elapsed();
+                    let diff =
+                        elapsed.as_secs() * 1_000_000_000 + u64::from(elapsed.subsec_nanos());
+                    if diff > interrupt.interval {
+                        interrupt.check_interrupt(diff, received_packets, num_packets);
+                    }
+
+                    if int_en != interrupt.interrupt_enabled {
+                        if interrupt.interrupt_enabled {
+                            self.enable_interrupt(queue_id).unwrap();
+                        } else {
+                            self.disable_interrupt(queue_id);
+                        }
+                    }
+                }
+            }
         }
 
         if rx_index != last_rx_index {
-            self.set_reg32(IXGBE_RDT(queue_id), last_rx_index as u32);
+            self.set_reg32(IXGBE_RDT(u32::from(queue_id)), last_rx_index as u32);
             self.rx_queues[queue_id as usize].rx_index = rx_index;
         }
 
         received_packets
     }
 
-    /// Pops as many packets as possible from `packets` to put them into the device`s tx queue.
-    fn tx_batch(&mut self, queue_id: u32, packets: &mut VecDeque<Packet>) -> usize {
+    /// Pops as many packets as possible from `buffer` to put them into the device`s tx queue.
+    fn tx_batch(&mut self, queue_id: u16, buffer: &mut VecDeque<Packet>) -> usize {
         let mut sent = 0;
 
         {
-            let mut queue = &mut self.tx_queues[queue_id as usize];
+            let mut queue = self
+                .tx_queues
+                .get_mut(queue_id as usize)
+                .expect("invalid tx queue id");
 
             let mut cur_index = queue.tx_index;
             let clean_index = clean_tx_queue(&mut queue);
 
             if queue.pool.is_none() {
-                if let Some(packet) = packets.get(0) {
+                if let Some(packet) = buffer.get(0) {
                     queue.pool = Some(packet.pool.clone());
                 }
             }
 
-            while let Some(packet) = packets.pop_front() {
+            while let Some(packet) = buffer.pop_front() {
                 assert!(
                     Rc::ptr_eq(queue.pool.as_ref().unwrap(), &packet.pool),
                     "distinct memory pools for a single tx queue are not supported yet"
@@ -279,7 +264,7 @@ impl IxyDevice for IxgbeDevice {
                 if clean_index == next_index {
                     // tx queue of device is full, push packet back onto the
                     // queue of to-be-sent packets
-                    packets.push_front(packet);
+                    buffer.push_front(packet);
                     break;
                 }
 
@@ -314,7 +299,7 @@ impl IxyDevice for IxgbeDevice {
         }
 
         self.set_reg32(
-            IXGBE_TDT(queue_id),
+            IXGBE_TDT(u32::from(queue_id)),
             self.tx_queues[queue_id as usize].tx_index as u32,
         );
 
@@ -337,7 +322,7 @@ impl IxyDevice for IxgbeDevice {
     }
 
     /// Resets the stats of this device.
-    fn reset_stats(&self) {
+    fn reset_stats(&mut self) {
         self.get_reg32(IXGBE_GPRC);
         self.get_reg32(IXGBE_GPTC);
         self.get_reg32(IXGBE_GORCL);
@@ -362,11 +347,86 @@ impl IxyDevice for IxgbeDevice {
 }
 
 impl IxgbeDevice {
+    /// Returns an initialized `IxgbeDevice` on success.
+    ///
+    /// # Panics
+    /// Panics if `num_rx_queues` or `num_tx_queues` exceeds `MAX_QUEUES`.
+    pub fn init(
+        pci_addr: &str,
+        num_rx_queues: u16,
+        num_tx_queues: u16,
+        interrupt_timeout: i16,
+    ) -> Result<IxgbeDevice, Box<dyn Error>> {
+        assert!(
+            num_rx_queues <= MAX_QUEUES,
+            "cannot configure {} rx queues: limit is {}",
+            num_rx_queues,
+            MAX_QUEUES
+        );
+        assert!(
+            num_tx_queues <= MAX_QUEUES,
+            "cannot configure {} tx queues: limit is {}",
+            num_tx_queues,
+            MAX_QUEUES
+        );
+
+        // Check if the NIC is IOMMU enabled...
+        let vfio = Path::new(&format!("/sys/bus/pci/devices/{}/iommu_group", pci_addr)).exists();
+
+        let device_fd: RawFd;
+        let (addr, len) = if vfio {
+            device_fd = vfio_init(pci_addr)?;
+            vfio_map_region(device_fd, VFIO_PCI_BAR0_REGION_INDEX)?
+        } else {
+            if unsafe { libc::getuid() } != 0 {
+                warn!("not running as root, this will probably fail");
+            }
+
+            device_fd = -1;
+            pci_map_resource(pci_addr)?
+        };
+
+        // initialize RX and TX queue
+        let rx_queues = Vec::with_capacity(num_rx_queues as usize);
+        let tx_queues = Vec::with_capacity(num_tx_queues as usize);
+
+        // create the IxyDevice
+        let mut dev = IxgbeDevice {
+            pci_addr: pci_addr.to_string(),
+            addr,
+            len,
+            num_rx_queues,
+            num_tx_queues,
+            rx_queues,
+            tx_queues,
+            vfio,
+            vfio_fd: unsafe { VFIO_CONTAINER_FILE_DESCRIPTOR },
+            vfio_device_fd: device_fd,
+            interrupts: Default::default(),
+        };
+
+        if dev.vfio {
+            dev.interrupts.interrupts_enabled = interrupt_timeout != 0;
+            dev.interrupts.timeout_ms = interrupt_timeout;
+            dev.interrupts.itr_rate = 0x028;
+            dev.setup_interrupts()?;
+        }
+
+        if !dev.vfio && interrupt_timeout != 0 {
+            warn!("Interrupts requested but VFIO not available: Disabling Interrupts!");
+            dev.interrupts.interrupts_enabled = false;
+        }
+
+        dev.reset_and_init(pci_addr)?;
+
+        Ok(dev)
+    }
+
     /// Resets and initializes this device.
     fn reset_and_init(&mut self, pci_addr: &str) -> Result<(), Box<dyn Error>> {
         info!("resetting device {}", pci_addr);
         // section 4.6.3.1 - disable all interrupts
-        self.set_reg32(IXGBE_EIMC, 0x7fff_ffff);
+        self.disable_interrupts();
 
         // section 4.6.3.2
         self.set_reg32(IXGBE_CTRL, IXGBE_CTRL_RST_MASK);
@@ -374,7 +434,7 @@ impl IxgbeDevice {
         thread::sleep(Duration::from_millis(10));
 
         // section 4.6.3.1 - disable interrupts again after reset
-        self.set_reg32(IXGBE_EIMC, 0x7fff_ffff);
+        self.disable_interrupts();
 
         let mac = self.get_mac_addr();
         info!("initializing device {}", pci_addr);
@@ -410,6 +470,11 @@ impl IxgbeDevice {
 
         for i in 0..self.num_tx_queues {
             self.start_tx_queue(i)?;
+        }
+
+        // enable interrupts
+        for queue in 0..self.num_rx_queues {
+            self.enable_interrupt(queue)?;
         }
 
         // enable promisc mode by default to make testing easier
@@ -554,7 +619,7 @@ impl IxgbeDevice {
             let mut txdctl = self.get_reg32(IXGBE_TXDCTL(u32::from(i)));
             // there are no defines for this in constants.rs for some reason
             // pthresh: 6:0, hthresh: 14:8, wthresh: 22:16
-            txdctl &= !(0x3F | (0x3F << 8) | (0x3F << 16));
+            txdctl &= !(0x7F | (0x7F << 8) | (0x7F << 16));
             txdctl |= 36 | (8 << 8) | (4 << 16);
 
             self.set_reg32(IXGBE_TXDCTL(u32::from(i)), txdctl);
@@ -700,10 +765,7 @@ impl IxgbeDevice {
     ///
     /// Panics if `self.addr` + `reg` does not belong to the mapped memory of the pci device.
     fn get_reg32(&self, reg: u32) -> u32 {
-        assert!(
-            reg as usize <= self.len - 4 as usize,
-            "memory access out of bounds"
-        );
+        assert!(reg as usize <= self.len - 4, "memory access out of bounds");
 
         unsafe { ptr::read_volatile((self.addr as usize + reg as usize) as *mut u32) }
     }
@@ -714,10 +776,7 @@ impl IxgbeDevice {
     ///
     /// Panics if `self.addr` + `reg` does not belong to the mapped memory of the pci device.
     fn set_reg32(&self, reg: u32, value: u32) {
-        assert!(
-            reg as usize <= self.len - 4 as usize,
-            "memory access out of bounds"
-        );
+        assert!(reg as usize <= self.len - 4, "memory access out of bounds");
 
         unsafe {
             ptr::write_volatile((self.addr as usize + reg as usize) as *mut u32, value);
@@ -754,6 +813,202 @@ impl IxgbeDevice {
             }
             thread::sleep(Duration::from_millis(100));
         }
+    }
+
+    /// Maps interrupt causes to vectors by specifying the `direction` (0 for Rx, 1 for Tx),
+    /// the `queue` ID and the corresponding `misx_vector`.
+    fn set_ivar(&self, direction: u32, queue: u16, mut msix_vector: u32) {
+        let mut ivar: u32;
+        let index: u32;
+        msix_vector |= IXGBE_IVAR_ALLOC_VAL;
+        index = 16 * (u32::from(queue) & 1) + 8 * direction;
+        ivar = self.get_reg32(IXGBE_IVAR(u32::from(queue) >> 1));
+        ivar &= !(0xFF << index);
+        ivar |= msix_vector << index;
+        self.set_reg32(IXGBE_IVAR(u32::from(queue) >> 1), ivar);
+    }
+
+    /// Clear all interrupt masks for all queues.
+    fn clear_interrupts(&self) {
+        // Clear interrupt mask
+        self.set_reg32(IXGBE_EIMC, IXGBE_IRQ_CLEAR_MASK);
+        self.get_reg32(IXGBE_EICR);
+    }
+
+    /// Clear interrupt for queue with `queue_id`.
+    fn clear_interrupt(&self, queue_id: u16) {
+        // Clear interrupt mask
+        self.set_reg32(IXGBE_EIMC, 1 << queue_id);
+        self.get_reg32(IXGBE_EICR);
+    }
+
+    /// Disable all interrupts for all queues.
+    fn disable_interrupts(&self) {
+        // Clear interrupt mask to stop from interrupts being generated
+        self.set_reg32(IXGBE_EIMS, 0x0000_0000);
+        self.clear_interrupts();
+    }
+
+    /// Disable interrupt for queue with `queue_id`.
+    fn disable_interrupt(&self, queue_id: u16) {
+        // Clear interrupt mask to stop from interrupts being generated
+        let mut mask: u32 = self.get_reg32(IXGBE_EIMS);
+        mask &= !(1 << queue_id);
+        self.set_reg32(IXGBE_EIMS, mask);
+        self.clear_interrupt(queue_id);
+        debug!("Using polling");
+    }
+
+    /// Enable MSI interrupt for queue with `queue_id`.
+    fn enable_msi_interrupt(&self, queue_id: u16) {
+        // Step 1: The software driver associates between Tx and Rx interrupt causes and the EICR
+        // register by setting the IVAR[n] registers.
+        self.set_ivar(0, queue_id, 0);
+
+        // Step 2: Program SRRCTL[n].RDMTS (per receive queue) if software uses the receive
+        // descriptor minimum threshold interrupt
+        // We don't use the minimum threshold interrupt
+
+        // Step 3: All interrupts should be set to 0b (no auto clear in the EIAC register). Following an
+        // interrupt, software might read the EICR register to check for the interrupt causes.
+        self.set_reg32(IXGBE_EIAC, 0x0000_0000);
+
+        // Step 4: Set the auto mask in the EIAM register according to the preferred mode of operation.
+        // In our case we prefer to not auto-mask the interrupts
+
+        // Step 5: Set the interrupt throttling in EITR[n] and GPIE according to the preferred mode of operation.
+        self.set_reg32(IXGBE_EITR(u32::from(queue_id)), self.interrupts.itr_rate);
+
+        // Step 6: Software clears EICR by writing all ones to clear old interrupt causes
+        self.clear_interrupts();
+
+        // Step 7: Software enables the required interrupt causes by setting the EIMS register
+        let mut mask: u32 = self.get_reg32(IXGBE_EIMS);
+        mask |= 1 << queue_id;
+        self.set_reg32(IXGBE_EIMS, mask);
+        debug!("Using MSI interrupts");
+    }
+
+    /// Enable MSI-X interrupt for queue with `queue_id`.
+    fn enable_msix_interrupt(&self, queue_id: u16) {
+        // Step 1: The software driver associates between interrupt causes and MSI-X vectors and the
+        //throttling timers EITR[n] by programming the IVAR[n] and IVAR_MISC registers.
+        let mut gpie: u32 = self.get_reg32(IXGBE_GPIE);
+        gpie |= IXGBE_GPIE_MSIX_MODE | IXGBE_GPIE_PBA_SUPPORT | IXGBE_GPIE_EIAME;
+        self.set_reg32(IXGBE_GPIE, gpie);
+        self.set_ivar(0, queue_id, u32::from(queue_id));
+
+        // Step 2: Program SRRCTL[n].RDMTS (per receive queue) if software uses the receive
+        // descriptor minimum threshold interrupt
+        // We don't use the minimum threshold interrupt
+
+        // Step 3: The EIAC[n] registers should be set to auto clear for transmit and receive interrupt
+        // causes (for best performance). The EIAC bits that control the other and TCP timer
+        // interrupt causes should be set to 0b (no auto clear).
+        self.set_reg32(IXGBE_EIAC, IXGBE_EIMS_RTX_QUEUE);
+
+        // Step 4: Set the auto mask in the EIAM register according to the preferred mode of operation.
+        // In our case we prefer to not auto-mask the interrupts
+
+        // Step 5: Set the interrupt throttling in EITR[n] and GPIE according to the preferred mode of operation.
+        // 0x000 (0us) => ... INT/s
+        // 0x008 (2us) => 488200 INT/s
+        // 0x010 (4us) => 244000 INT/s
+        // 0x028 (10us) => 97600 INT/s
+        // 0x0C8 (50us) => 20000 INT/s
+        // 0x190 (100us) => 9766 INT/s
+        // 0x320 (200us) => 4880 INT/s
+        // 0x4B0 (300us) => 3255 INT/s
+        // 0x640 (400us) => 2441 INT/s
+        // 0x7D0 (500us) => 2000 INT/s
+        // 0x960 (600us) => 1630 INT/s
+        // 0xAF0 (700us) => 1400 INT/s
+        // 0xC80 (800us) => 1220 INT/s
+        // 0xE10 (900us) => 1080 INT/s
+        // 0xFA7 (1000us) => 980 INT/s
+        // 0xFFF (1024us) => 950 INT/s
+        self.set_reg32(IXGBE_EITR(u32::from(queue_id)), self.interrupts.itr_rate);
+
+        // Step 6: Software enables the required interrupt causes by setting the EIMS register
+        let mut mask: u32 = self.get_reg32(IXGBE_EIMS);
+        mask |= 1 << queue_id;
+        self.set_reg32(IXGBE_EIMS, mask);
+        debug!("Using MSIX interrupts");
+    }
+
+    /// Enable MSI or MSI-X interrupt for queue with `queue_id` depending on which is supported (Prefer MSI-x).
+    fn enable_interrupt(&self, queue_id: u16) -> Result<(), Box<dyn Error>> {
+        if !self.interrupts.interrupts_enabled {
+            return Ok(());
+        }
+        match self.interrupts.interrupt_type {
+            VFIO_PCI_MSIX_IRQ_INDEX => self.enable_msix_interrupt(queue_id),
+            VFIO_PCI_MSI_IRQ_INDEX => self.enable_msi_interrupt(queue_id),
+            _ => {
+                return Err(format!(
+                    "interrupt type not supported: {}",
+                    self.interrupts.interrupt_type
+                )
+                .into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Setup interrupts by enabling VFIO interrupts.
+    fn setup_interrupts(&mut self) -> Result<(), Box<dyn Error>> {
+        if !self.interrupts.interrupts_enabled {
+            self.interrupts.queues = Vec::with_capacity(0);
+            return Ok(());
+        }
+        self.interrupts.queues = Vec::with_capacity(self.num_rx_queues as usize);
+        self.interrupts.vfio_setup_interrupt(self.vfio_device_fd)?;
+        match self.interrupts.interrupt_type {
+            VFIO_PCI_MSIX_IRQ_INDEX => {
+                for rx_queue in 0..self.num_rx_queues {
+                    let mut queue = InterruptsQueue {
+                        vfio_event_fd: 0,
+                        vfio_epoll_fd: 0,
+                        last_time_checked: Instant::now(),
+                        rx_pkts: 0,
+                        moving_avg: Default::default(),
+                        interrupt_enabled: true,
+                        interval: INTERRUPT_INITIAL_INTERVAL,
+                        instr_counter: 0,
+                    };
+                    info!("enabling MSIX interrupts for queue {}", rx_queue);
+                    queue.vfio_enable_msix(self.vfio_device_fd, u32::from(rx_queue))?;
+                    queue.vfio_epoll_ctl(queue.vfio_event_fd)?;
+                    self.interrupts.queues.push(queue);
+                }
+            }
+            VFIO_PCI_MSI_IRQ_INDEX => {
+                for _rx_queue in 0..self.num_rx_queues {
+                    let mut queue = InterruptsQueue {
+                        vfio_event_fd: 0,
+                        vfio_epoll_fd: 0,
+                        last_time_checked: Instant::now(),
+                        rx_pkts: 0,
+                        moving_avg: Default::default(),
+                        interrupt_enabled: true,
+                        interval: INTERRUPT_INITIAL_INTERVAL,
+                        instr_counter: 0,
+                    };
+                    info!("enabling MSI interrupts for queue {}", _rx_queue);
+                    queue.vfio_enable_msi(self.vfio_device_fd)?;
+                    queue.vfio_epoll_ctl(queue.vfio_event_fd)?;
+                    self.interrupts.queues.push(queue);
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "interrupt type not supported: {}",
+                    self.interrupts.interrupt_type
+                )
+                .into());
+            }
+        }
+        Ok(())
     }
 }
 
